@@ -346,7 +346,7 @@ app = FastAPI(title="Revit Automation Hub API", version="2.0.0", lifespan=lifesp
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://automationhubfrontend.onrender.com"
+        "https://revitautomationhub.onrender.com"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -774,4 +774,5 @@ if __name__ == "__main__":
     print("📍 API will be available at: http://localhost:8000")
     print("📚 API Documentation: http://localhost:8000/docs")
     print("🔐 CORS enabled for: http://localhost:5173\n")
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
