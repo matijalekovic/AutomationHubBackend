@@ -346,7 +346,7 @@ app = FastAPI(title="Revit Automation Hub API", version="2.0.0", lifespan=lifesp
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://automationhubbackend.onrender.com"
+        "https://automationhubfrontend.onrender.com"
     ],
     allow_credentials=True,
     allow_methods=["*"],
