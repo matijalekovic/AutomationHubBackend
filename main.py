@@ -1,32 +1,22 @@
 """
 Revit Automation Hub Backend
 A complete FastAPI backend for managing Revit automation requests with AI analysis.
-Updated to match frontend requirements including user management, file uploads, and email notifications.
 """
 
 import os
 import time
 import json
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 from typing import Optional, List
+from base64 import b64decode
 from contextlib import asynccontextmanager
 
-# Load environment variables from .env file if it exists
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass  # python-dotenv not installed, use system environment variables
-
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form
+from fastapi import FastAPI, Depends, HTTPException, status, File, UploadFile
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, Text, ForeignKey, BigInteger
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
-from pydantic import BaseModel, EmailStr, ConfigDict, Field
+from pydantic import BaseModel, EmailStr, ConfigDict
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 import google.generativeai as genai
@@ -37,16 +27,8 @@ import google.generativeai as genai
 
 SECRET_KEY = os.getenv("SECRET_KEY", "revit-hub-secret-key-change-in-production")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 GEMINI_API_KEY = os.getenv("API_KEY")
-
-# Email Configuration (Optional - for SMTP)
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-SMTP_FROM = os.getenv("SMTP_FROM", "noreply@revithub.com")
-DEFAULT_ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@revithub.com")
 
 # Configure Gemini
 if GEMINI_API_KEY:
@@ -69,13 +51,13 @@ class User(Base):
     __tablename__ = "users"
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    name = Column(String, nullable=False)
     email = Column(String, unique=True, index=True, nullable=False)
-    password = Column(String, nullable=False)  # Hashed
+    hashed_password = Column(String, nullable=False)
+    full_name = Column(String, nullable=False)
     role = Column(String, nullable=False)  # ARCHITECT or DEVELOPER
-    avatar = Column(String, nullable=True)
+    avatar_url = Column(String, nullable=True)
     
-    requests = relationship("Request", back_populates="requester", foreign_keys="Request.requester_id")
+    requests = relationship("Request", back_populates="requester")
 
 
 class Request(Base):
@@ -84,21 +66,19 @@ class Request(Base):
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     title = Column(String, nullable=False)
     description = Column(Text, nullable=False)
-    status = Column(String, nullable=False, default="PENDING")
-    priority = Column(String, nullable=False)
+    priority = Column(String, nullable=False)  # LOW, MEDIUM, HIGH, CRITICAL
+    status = Column(String, nullable=False, default="PENDING")  # PENDING, IN_PROGRESS, COMPLETED, REJECTED
     project_name = Column(String, nullable=False)
     revit_version = Column(String, nullable=False)
-    requester_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    requester_name = Column(String, nullable=False)  # Cached for performance
+    due_date = Column(BigInteger, nullable=True)
     created_at = Column(BigInteger, nullable=False)
     updated_at = Column(BigInteger, nullable=False)
-    due_date = Column(String, nullable=True)  # ISO Date string
-    result_script = Column(Text, nullable=True)
-    result_file_name = Column(String, nullable=True)
-    ai_analysis = Column(Text, nullable=True)  # JSON string
+    requester_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     developer_notes = Column(Text, nullable=True)
+    result_script = Column(Text, nullable=True)
+    ai_analysis_json = Column(Text, nullable=True)
     
-    requester = relationship("User", back_populates="requests", foreign_keys=[requester_id])
+    requester = relationship("User", back_populates="requests")
     attachments = relationship("Attachment", back_populates="request", cascade="all, delete-orphan")
 
 
@@ -107,9 +87,9 @@ class Attachment(Base):
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     request_id = Column(Integer, ForeignKey("requests.id"), nullable=False)
-    name = Column(String, nullable=False)
-    type = Column(String, nullable=False)  # MimeType
-    data = Column(Text, nullable=False)  # Base64 string
+    file_name = Column(String, nullable=False)
+    file_type = Column(String, nullable=False)
+    data_base64 = Column(Text, nullable=False)
     
     request = relationship("Request", back_populates="attachments")
 
@@ -122,99 +102,72 @@ Base.metadata.create_all(bind=engine)
 # ============================================================================
 
 class AttachmentCreate(BaseModel):
-    name: str
-    type: str
-    data: str
+    file_name: str
+    file_type: str
+    data_base64: str
 
 
 class AttachmentResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     
     id: int
-    name: str
-    type: str
-    data: str
+    file_name: str
+    file_type: str
+    data_base64: str
 
 
-class UserCreate(BaseModel):
-    name: str
-    email: EmailStr
-    password: str
-    role: str
+class RequestCreate(BaseModel):
+    title: str
+    description: str
+    priority: str
+    project_name: str
+    revit_version: str
+    due_date: Optional[int] = None
+    attachments: List[AttachmentCreate] = []
+
+
+class RequestUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    priority: Optional[str] = None
+    status: Optional[str] = None
+    project_name: Optional[str] = None
+    revit_version: Optional[str] = None
+    due_date: Optional[int] = None
+    developer_notes: Optional[str] = None
+    result_script: Optional[str] = None
+    ai_analysis_json: Optional[str] = None
 
 
 class UserResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     
     id: int
-    name: str
     email: str
+    full_name: str
     role: str
-    avatar: Optional[str] = None
-
-
-class RequestCreate(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
-    
-    title: str
-    description: str
-    status: str = "PENDING"
-    priority: str
-    project_name: str = Field(..., alias="projectName")
-    revit_version: str = Field(..., alias="revitVersion")
-    requester_id: int = Field(..., alias="requesterId")
-    requester_name: str = Field(..., alias="requesterName")
-    due_date: Optional[str] = Field(None, alias="dueDate")
-    attachments: List[AttachmentCreate] = []
-
-
-class RequestUpdate(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
-    
-    title: Optional[str] = None
-    description: Optional[str] = None
-    status: Optional[str] = None
-    priority: Optional[str] = None
-    project_name: Optional[str] = Field(None, alias="projectName")
-    revit_version: Optional[str] = Field(None, alias="revitVersion")
-    due_date: Optional[str] = Field(None, alias="dueDate")
-    result_script: Optional[str] = Field(None, alias="resultScript")
-    result_file_name: Optional[str] = Field(None, alias="resultFileName")
-    ai_analysis: Optional[str] = Field(None, alias="aiAnalysis")
-    developer_notes: Optional[str] = Field(None, alias="developerNotes")
+    avatar_url: Optional[str] = None
 
 
 class RequestResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+    model_config = ConfigDict(from_attributes=True)
     
     id: int
     title: str
     description: str
-    status: str
     priority: str
-    project_name: str = Field(..., alias="projectName", serialization_alias="projectName")
-    revit_version: str = Field(..., alias="revitVersion", serialization_alias="revitVersion")
-    requester_id: int = Field(..., alias="requesterId", serialization_alias="requesterId")
-    requester_name: str = Field(..., alias="requesterName", serialization_alias="requesterName")
-    created_at: int = Field(..., alias="createdAt", serialization_alias="createdAt")
-    updated_at: int = Field(..., alias="updatedAt", serialization_alias="updatedAt")
-    due_date: Optional[str] = Field(None, alias="dueDate", serialization_alias="dueDate")
-    result_script: Optional[str] = Field(None, alias="resultScript", serialization_alias="resultScript")
-    result_file_name: Optional[str] = Field(None, alias="resultFileName", serialization_alias="resultFileName")
-    ai_analysis: Optional[str] = Field(None, alias="aiAnalysis", serialization_alias="aiAnalysis")
-    developer_notes: Optional[str] = Field(None, alias="developerNotes", serialization_alias="developerNotes")
+    status: str
+    project_name: str
+    revit_version: str
+    due_date: Optional[int] = None
+    created_at: int
+    updated_at: int
+    requester_id: int
+    developer_notes: Optional[str] = None
+    result_script: Optional[str] = None
+    ai_analysis_json: Optional[str] = None
     requester: UserResponse
     attachments: List[AttachmentResponse] = []
-
-
-class LoginRequest(BaseModel):
-    username: str  # email
-    password: str
-
-
-class LoginResponse(BaseModel):
-    access_token: str
-    user: UserResponse
 
 
 class Token(BaseModel):
@@ -222,18 +175,12 @@ class Token(BaseModel):
     token_type: str
 
 
-class EmailNotification(BaseModel):
-    subject: str
-    body: str
-    to: Optional[str] = None
-
-
 # ============================================================================
 # AUTHENTICATION
 # ============================================================================
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -265,7 +212,7 @@ def get_db():
 
 def authenticate_user(db: Session, email: str, password: str):
     user = db.query(User).filter(User.email == email).first()
-    if not user or not verify_password(password, user.password):
+    if not user or not verify_password(password, user.hashed_password):
         return False
     return user
 
@@ -290,15 +237,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     return user
 
 
-def require_developer(current_user: User = Depends(get_current_user)):
-    if current_user.role != "DEVELOPER":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only developers can access this resource"
-        )
-    return current_user
-
-
 # ============================================================================
 # FASTAPI APP
 # ============================================================================
@@ -312,42 +250,38 @@ async def lifespan(app: FastAPI):
         if user_count == 0:
             # Create architect
             architect = User(
-                name="Architecture Lead",
                 email="arch@design.com",
-                password=get_password_hash("revit"),
+                hashed_password=get_password_hash("revit"),
+                full_name="Architecture Lead",
                 role="ARCHITECT",
-                avatar="https://api.dicebear.com/7.x/avataaars/svg?seed=architect"
+                avatar_url="https://api.dicebear.com/7.x/avataaars/svg?seed=architect"
             )
             # Create developer
             developer = User(
-                name="Python Developer",
                 email="dev@code.com",
-                password=get_password_hash("python"),
+                hashed_password=get_password_hash("python"),
+                full_name="Python Developer",
                 role="DEVELOPER",
-                avatar="https://api.dicebear.com/7.x/avataaars/svg?seed=developer"
+                avatar_url="https://api.dicebear.com/7.x/avataaars/svg?seed=developer"
             )
             db.add(architect)
             db.add(developer)
             db.commit()
             print("✅ Database seeded with default users")
-            print("   - Architect: arch@design.com / revit")
-            print("   - Developer: dev@code.com / python")
     finally:
         db.close()
     
     yield
     
-    # Shutdown
+    # Shutdown (cleanup if needed)
     print("🔴 Shutting down...")
 
-app = FastAPI(title="Revit Automation Hub API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Revit Automation Hub API", version="1.0.0", lifespan=lifespan)
 
 # CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://revitautomationhub.onrender.com"
-    ],
+    allow_origins=["http://localhost:3000", "http://localhost:5173", "null"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -358,29 +292,24 @@ app.add_middleware(
 # ROUTES - AUTHENTICATION
 # ============================================================================
 
-@app.post("/auth/login", response_model=LoginResponse)
-async def login(login_data: LoginRequest, db: Session = Depends(get_db)):
-    user = authenticate_user(db, login_data.username, login_data.password)
+@app.post("/token", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = authenticate_user(db, form_data.username, form_data.password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={"sub": user.email}, expires_delta=access_token_expires
     )
-    
-    return LoginResponse(
-        access_token=access_token,
-        user=UserResponse.model_validate(user)
-    )
+    return {"access_token": access_token, "token_type": "bearer"}
 
 
 # ============================================================================
-# ROUTES - USER MANAGEMENT
+# ROUTES - USERS
 # ============================================================================
 
 @app.get("/users/me", response_model=UserResponse)
@@ -388,93 +317,58 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
     return current_user
 
 
-@app.get("/users", response_model=List[UserResponse])
-async def list_users(
-    current_user: User = Depends(require_developer),
-    db: Session = Depends(get_db)
-):
-    users = db.query(User).all()
-    return users
-
-
-@app.post("/users", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def create_user(
-    user_data: UserCreate,
-    current_user: User = Depends(require_developer),
-    db: Session = Depends(get_db)
-):
-    # Check if email already exists
-    existing_user = db.query(User).filter(User.email == user_data.email).first()
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered"
-        )
-    
-    # Generate avatar URL based on name
-    avatar_seed = user_data.name.lower().replace(" ", "")
-    avatar_url = f"https://api.dicebear.com/7.x/avataaars/svg?seed={avatar_seed}"
-    
-    new_user = User(
-        name=user_data.name,
-        email=user_data.email,
-        password=get_password_hash(user_data.password),
-        role=user_data.role,
-        avatar=avatar_url
-    )
-    
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
-    
-    return new_user
-
-
-@app.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_user(
-    user_id: int,
-    current_user: User = Depends(require_developer),
-    db: Session = Depends(get_db)
-):
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    # Prevent deleting yourself
-    if user.id == current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot delete your own account"
-        )
-    
-    db.delete(user)
-    db.commit()
-    
-    return None
-
-
 # ============================================================================
-# ROUTES - REQUEST MANAGEMENT
+# ROUTES - REQUESTS
 # ============================================================================
 
 @app.get("/requests", response_model=List[RequestResponse])
-async def list_requests(
-    status: Optional[str] = None,
+async def get_requests(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role == "ARCHITECT":
+        requests = db.query(Request).filter(Request.requester_id == current_user.id).all()
+    else:  # DEVELOPER
+        requests = db.query(Request).all()
+    return requests
+
+
+@app.post("/requests", response_model=RequestResponse, status_code=status.HTTP_201_CREATED)
+async def create_request(
+    request_data: RequestCreate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    query = db.query(Request)
+    current_time = int(time.time())
     
-    # Architects only see their own requests
-    if current_user.role == "ARCHITECT":
-        query = query.filter(Request.requester_id == current_user.id)
+    new_request = Request(
+        title=request_data.title,
+        description=request_data.description,
+        priority=request_data.priority,
+        status="PENDING",
+        project_name=request_data.project_name,
+        revit_version=request_data.revit_version,
+        due_date=request_data.due_date,
+        created_at=current_time,
+        updated_at=current_time,
+        requester_id=current_user.id
+    )
     
-    # Optional status filter (for Scripts Library - COMPLETED requests)
-    if status:
-        query = query.filter(Request.status == status)
+    db.add(new_request)
+    db.commit()
+    db.refresh(new_request)
     
-    requests = query.order_by(Request.created_at.desc()).all()
-    return requests
+    # Add attachments
+    for attachment_data in request_data.attachments:
+        attachment = Attachment(
+            request_id=new_request.id,
+            file_name=attachment_data.file_name,
+            file_type=attachment_data.file_type,
+            data_base64=attachment_data.data_base64
+        )
+        db.add(attachment)
+    
+    db.commit()
+    db.refresh(new_request)
+    
+    return new_request
 
 
 @app.get("/requests/{request_id}", response_model=RequestResponse)
@@ -487,56 +381,11 @@ async def get_request(
     if not request_obj:
         raise HTTPException(status_code=404, detail="Request not found")
     
-    # Authorization check for architects
+    # Authorization check
     if current_user.role == "ARCHITECT" and request_obj.requester_id != current_user.id:
-        raise HTTPException(
-            status_code=403,
-            detail="Not authorized to view this request"
-        )
+        raise HTTPException(status_code=403, detail="Not authorized to view this request")
     
     return request_obj
-
-
-@app.post("/requests", response_model=RequestResponse, status_code=status.HTTP_201_CREATED)
-async def create_request(
-    request_data: RequestCreate,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    current_time = int(time.time() * 1000)  # Milliseconds
-    
-    new_request = Request(
-        title=request_data.title,
-        description=request_data.description,
-        status=request_data.status,
-        priority=request_data.priority,
-        project_name=request_data.project_name,
-        revit_version=request_data.revit_version,
-        requester_id=request_data.requester_id,
-        requester_name=request_data.requester_name,
-        due_date=request_data.due_date,
-        created_at=current_time,
-        updated_at=current_time
-    )
-    
-    db.add(new_request)
-    db.commit()
-    db.refresh(new_request)
-    
-    # Add attachments
-    for attachment_data in request_data.attachments:
-        attachment = Attachment(
-            request_id=new_request.id,
-            name=attachment_data.name,
-            type=attachment_data.type,
-            data=attachment_data.data
-        )
-        db.add(attachment)
-    
-    db.commit()
-    db.refresh(new_request)
-    
-    return new_request
 
 
 @app.put("/requests/{request_id}", response_model=RequestResponse)
@@ -551,11 +400,11 @@ async def update_request(
         raise HTTPException(status_code=404, detail="Request not found")
     
     # Update fields
-    update_data = request_update.model_dump(exclude_unset=True)
+    update_data = request_update.dict(exclude_unset=True)
     for field, value in update_data.items():
         setattr(request_obj, field, value)
     
-    request_obj.updated_at = int(time.time() * 1000)
+    request_obj.updated_at = int(time.time())
     
     db.commit()
     db.refresh(request_obj)
@@ -575,10 +424,7 @@ async def delete_request(
     
     # Authorization check
     if current_user.role == "ARCHITECT" and request_obj.requester_id != current_user.id:
-        raise HTTPException(
-            status_code=403,
-            detail="Not authorized to delete this request"
-        )
+        raise HTTPException(status_code=403, detail="Not authorized to delete this request")
     
     db.delete(request_obj)
     db.commit()
@@ -606,69 +452,63 @@ async def analyze_request(
     if not request_obj:
         raise HTTPException(status_code=404, detail="Request not found")
     
-    # Build the analysis prompt
-    system_prompt = f"""You are an expert Revit API Automation Engineer and Python Developer.
+    # Build the prompt
+    system_prompt = f"""You are an expert Revit API Automation Engineer and Python Developer. 
 Analyze the following automation request for Revit {request_obj.revit_version} in Project "{request_obj.project_name}".
 
 REQUEST TITLE: {request_obj.title}
 DESCRIPTION: {request_obj.description}
-PRIORITY: {request_obj.priority}
 
-Provide a detailed technical analysis in JSON format with these exact fields:
-1. complexityScore: An integer from 1-10 (1=trivial, 10=extremely complex)
-2. suggestedNamespaces: Array of relevant Autodesk.Revit.DB namespaces (e.g., ["Autodesk.Revit.DB", "Autodesk.Revit.DB.Architecture"])
-3. implementationStrategy: A concise 2-3 paragraph explanation of the approach
-4. pseudoCode: Python-like pseudo-code showing the general structure using Revit API patterns
+Your goal is to provide a JSON response with:
+1. complexityScore: An integer 1-10.
+2. suggestedNamespaces: A list of relevant Autodesk.Revit.DB namespaces.
+3. implementationStrategy: A concise textual explanation of how to solve this.
+4. pseudoCode: A pythonic pseudo-code snippet using the Revit API structure.
 
-Respond ONLY with valid JSON. No markdown, no code blocks, just the JSON object."""
+RETURN JSON ONLY."""
     
     try:
-        # Prepare content for Gemini
+        # Prepare content parts
         content_parts = [system_prompt]
         
         # Add image attachments if any
-        image_attachments = [att for att in request_obj.attachments if att.type.startswith("image/")]
+        image_attachments = [att for att in request_obj.attachments if att.file_type.startswith("image/")]
         for attachment in image_attachments:
             try:
+                # Gemini expects the base64 data and mime type
                 content_parts.append({
-                    "mime_type": attachment.type,
-                    "data": attachment.data
+                    "mime_type": attachment.file_type,
+                    "data": attachment.data_base64
                 })
             except Exception as e:
-                print(f"Warning: Could not process image attachment: {e}")
+                print(f"Error processing image attachment: {e}")
         
         # Call Gemini API
         model = genai.GenerativeModel("gemini-2.0-flash-exp")
         response = model.generate_content(content_parts)
         
-        # Extract and clean JSON response
+        # Extract and parse JSON from response
         response_text = response.text.strip()
         
         # Remove markdown code blocks if present
         if response_text.startswith("```json"):
             response_text = response_text[7:]
-        elif response_text.startswith("```"):
+        if response_text.startswith("```"):
             response_text = response_text[3:]
         if response_text.endswith("```"):
             response_text = response_text[:-3]
         
         response_text = response_text.strip()
         
-        # Parse and validate JSON
-        analysis_result = json.loads(response_text)
-        
-        # Validate required fields
-        required_fields = ["complexityScore", "suggestedNamespaces", "implementationStrategy", "pseudoCode"]
-        for field in required_fields:
-            if field not in analysis_result:
-                raise ValueError(f"Missing required field: {field}")
+        # Parse JSON
+        analysis_json = json.loads(response_text)
         
         # Save to database
-        request_obj.ai_analysis = json.dumps(analysis_result)
-        request_obj.updated_at = int(time.time() * 1000)
+        request_obj.ai_analysis_json = json.dumps(analysis_json)
+        request_obj.updated_at = int(time.time())
         db.commit()
         
-        return analysis_result
+        return analysis_json
         
     except json.JSONDecodeError as e:
         raise HTTPException(
@@ -690,77 +530,8 @@ Respond ONLY with valid JSON. No markdown, no code blocks, just the JSON object.
 async def root():
     return {
         "message": "Revit Automation Hub API",
-        "version": "2.0.0",
-        "status": "running",
-        "endpoints": {
-            "docs": "/docs",
-            "auth": "/auth/login",
-            "users": "/users",
-            "requests": "/requests"
-        }
-    }
-
-
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": int(time.time())}
-
-
-# ============================================================================
-# ROUTES - NOTIFICATIONS
-# ============================================================================
-
-@app.post("/notifications/email")
-async def send_email_notification(
-    notification: EmailNotification,
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Send email notification. 
-    In production, this would use SMTP. For development, it logs to console.
-    """
-    recipient = notification.to or DEFAULT_ADMIN_EMAIL
-    
-    # Check if SMTP is configured
-    if SMTP_USER and SMTP_PASSWORD:
-        try:
-            # Create message
-            msg = MIMEMultipart()
-            msg['From'] = SMTP_FROM
-            msg['To'] = recipient
-            msg['Subject'] = notification.subject
-            
-            # Add body
-            msg.attach(MIMEText(notification.body, 'html'))
-            
-            # Send email
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-                server.starttls()
-                server.login(SMTP_USER, SMTP_PASSWORD)
-                server.send_message(msg)
-            
-            print(f"✉️  Email sent to {recipient}: {notification.subject}")
-            return {"status": "sent", "to": recipient, "method": "smtp"}
-            
-        except Exception as e:
-            print(f"❌ Failed to send email via SMTP: {e}")
-            # Fall back to console logging
-    
-    # Development mode - log to console
-    print("\n" + "="*80)
-    print("📧 EMAIL NOTIFICATION (Development Mode)")
-    print("="*80)
-    print(f"To: {recipient}")
-    print(f"Subject: {notification.subject}")
-    print("-"*80)
-    print(notification.body)
-    print("="*80 + "\n")
-    
-    return {
-        "status": "logged",
-        "to": recipient,
-        "method": "console",
-        "message": "Email logged to console (SMTP not configured)"
+        "version": "1.0.0",
+        "docs": "/docs"
     }
 
 
@@ -770,9 +541,4 @@ async def send_email_notification(
 
 if __name__ == "__main__":
     import uvicorn
-    print("\n🚀 Starting Revit Automation Hub Backend...")
-    print("📍 API will be available at: http://localhost:8000")
-    print("📚 API Documentation: http://localhost:8000/docs")
-    print("🔐 CORS enabled for: http://localhost:5173\n")
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
